@@ -197,6 +197,104 @@ static Diagnostic ImportDiagnostic(const string &file, const Import &imp, const 
 // at the import (Ast::Report), and the program goes on without what it
 // would have loaded: the names it would have declared are unknown where
 // they are used.
+// `extern fn f(...) calls "sym", ...` (prototype). The parser renamed such an
+// extern f__reentry; here every one gets a Goose wrapper under its own name,
+// in a source of its package's own:
+//
+//     fn f(params) -> R {
+//         var r = f__reentry(args);
+//         while gs_reentry_phantom() {     // never emitted (CodeGen)
+//             let x = gs_reentry_any();
+//             cb(x as T, ...);             // each export the clause names
+//             r = f__reentry(args);
+//         }
+//         return r;
+//     }
+//
+// The loop exists only for the analyses. To the checker (§5), BCE and the
+// stack layout, the callbacks are then calls the wrapper makes, any number
+// of times, while the arguments are still in use: what C may actually do.
+// A symbol no export of the program carries is left out, since C cannot
+// call it. Each named export gets a bit; the extern's mask lets C call
+// those (the runtime guard in the export wrappers).
+static void SynthesizeReentry(Ast &ast, vector<vector<string>> &importsof) {
+    map<string, SFunction *> exports;
+    for (auto sf : ast.functions)
+        if (sf->isexport) exports[sf->cname] = sf;
+    if (ast.callsexterns.empty()) return;
+    auto nextbit = 0;
+    map<int, string> texts;   // Package -> its wrappers' source.
+    auto qual = [](string_view ns, string_view name) {
+        return ns.empty() ? cat("::", name) : cat(ns, "::", name);
+    };
+    auto argof = [](string_view t) -> string {
+        static const set<string_view> nums = { "i8", "i16", "i32", "i64", "u8", "u16", "u32",
+                                               "u64", "f32", "f64", "int", "float" };
+        if (t == "i64") return "reentry_x__";
+        if (nums.count(t)) return cat("reentry_x__ as ", t);
+        if (t == "bool") return "reentry_x__ != 0";
+        return cat("default<", t, ">()");
+    };
+    for (auto sf : ast.callsexterns) {
+        auto pkg = ast.filepkg[sf->line.fileidx];
+        auto &txt = texts[pkg];
+        string args;
+        for (auto &p : sf->params) args += cat(args.empty() ? "" : ", ", p.name);
+        auto call = cat(qual(sf->ns, sf->name), "(", args, ")");
+        auto ret = !sf->callsrets.empty();
+        string cbs;
+        for (auto &sym : sf->callsyms) {
+            auto it = exports.find(sym);
+            if (it == exports.end()) continue;
+            auto ex = it->second;
+            if (!ex->generics.empty())
+                throw CompileError { cat("calls \"", sym, "\": the export is generic") };
+            if (ex->exportbit < 0) {
+                if (nextbit == 64)
+                    throw CompileError { "calls clauses name more than 64 exports (prototype limit)" };
+                ex->exportbit = nextbit++;
+            }
+            sf->reentmask |= uint64_t(1) << ex->exportbit;
+            string cargs;
+            for (auto &p : ex->params) {
+                if (p.typetext.empty())
+                    throw CompileError { cat("calls \"", sym, "\": parameter ", p.name, " of the export has no type") };
+                cargs += cat(cargs.empty() ? "" : ", ", argof(p.typetext));
+            }
+            cbs += cat("        ", qual(ex->ns, ex->name), "(", cargs, ");\n");
+        }
+        // `extern recursive fn f(...) calls ...`: a callback may call f again,
+        // a cycle the wrapper enters (§7.8).
+        txt += cat(sf->isrec ? "recursive fn " : "fn ", qual(sf->ns, sf->callsname), "(",
+                   sf->callsparams, ")",
+                   ret ? cat(" -> ", sf->callsrets) : string(), " {\n",
+                   ret ? "    var reentry_r__ = " : "    ", call, ";\n",
+                   "    while ::gs_reentry_phantom() {\n",
+                   "        let reentry_x__ = ::gs_reentry_any();\n", cbs,
+                   ret ? "        reentry_r__ = " : "        ", call, ";\n",
+                   "    }\n", ret ? "    return reentry_r__;\n" : "", "}\n\n");
+    }
+    auto first = true;
+    ast.reentryfiles = (int)ast.sources.size();
+    for (auto &[pkg, txt] : texts) {
+        auto src = make_unique<string>();
+        if (first) {
+            *src = "extern fn ::gs_reentry_phantom() -> bool;\n"
+                   "extern fn ::gs_reentry_any() -> i64;\n\n";
+            first = false;
+        }
+        *src += txt;
+        auto fileidx = (int)ast.sources.size();
+        ast.sources.emplace_back(cat("<reentry wrappers of ", ast.packages[pkg].name, ">"),
+                                 std::move(src));
+        ast.filepkg.push_back(pkg);
+        importsof.emplace_back();
+        auto &[filename, source] = ast.sources.back();
+        Parser parser(ast, filename, *source, fileidx);
+        parser.ParseTop();
+    }
+}
+
 void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlibdirs,
                   const string &exedir, const SourceProvider &sources = {}) {
     auto available = [&](const string &path) {
@@ -474,6 +572,7 @@ void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlib
     // and stable-sort the initialization list by rank. A file in an import
     // cycle is visited once, and its rank is then whatever the walk reached
     // first, which is all that order can mean there.
+    SynthesizeReentry(ast, importsof);
     vector<int> rank(ast.sources.size(), 0);
     vector<char> state(ast.sources.size(), 0);   // 0 unvisited, 1 on the stack, 2 ranked.
     auto next = 0;

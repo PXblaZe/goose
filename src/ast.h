@@ -390,6 +390,7 @@ struct Param {
     string_view name;
     Line line;                  // Of the name.
     TypeExpr *type = nullptr;   // Null = untyped, i.e. generic.
+    string_view typetext;       // The type as written.
     Node *defaultval = nullptr; // What a call leaving the argument out passes (§7.1).
     bool isvar = false;
 };
@@ -1537,6 +1538,10 @@ struct SFunction {
     bool isthread = false;
     bool isextern = false;      // A C function behind a Goose signature (§7.10); no body.
     bool isexport = false;      // A Goose function exposed through a C ABI wrapper.
+    // The specialization its C wrapper calls (TypeCheck::CheckExport). Goose
+    // code calling it, a reentry wrapper's included (SynthesizeReentry), may
+    // make others, which the analyses use for those calls.
+    FnSpec *exportspec = nullptr;
     string cname;               // Its C symbol (the Goose name unless spelled out).
     // The shared library an extern block binds it from by that symbol as
     // the program starts (§7.10); empty for an extern the link resolves.
@@ -1545,6 +1550,19 @@ struct SFunction {
     // (os.trim_memory): each caller, and transitively theirs, publishes all
     // of its cached tops before the call (CodeGen::CollectSpecs, SyncReach).
     bool readsalltops = false;
+    // `extern fn f(...) calls "sym", ...`: C may call these exported symbols
+    // back before f returns. The extern is renamed f__reentry and a Goose
+    // wrapper named f (synthesized by SynthesizeReentry) calls it, so that
+    // every analysis sees the callbacks as calls the wrapper makes.
+    vector<string> callsyms;
+    string_view callsname;        // The name the wrapper takes.
+    string_view callsparams;      // The declaration's parameter list, as written.
+    string_view callsrets;        // Its return types, as written.
+    uint64_t reentmask = 0;       // The exports it lets C call (bits of exportbit).
+    int exportbit = -1;           // An export named by some calls clause: its bit.
+    // gs_reentry_phantom / gs_reentry_any: they exist only for the analyses.
+    // A loop whose condition calls one is never emitted (CodeGen).
+    bool isphantom = false;
     // A runtime entry point that reports a failure where the program called
     // the standard library: it takes a trailing const gs_loc * (runtime.h),
     // which its callers pass as they do a library function's (CodeGen::CallerLoc).
@@ -2630,6 +2648,31 @@ struct Ast {
     vector<TypeExpr *> alltypes;
     vector<TypeDetail *> typedetails;
     vector<SFunction *> functions;
+    vector<SFunction *> callsexterns;   // Externs with a calls clause, in parse order.
+    int reentryfiles = -1;   // The first source SynthesizeReentry made; a dump leaves them out.
+    // An extern C may call back through (SynthesizeReentry): its wrapper takes
+    // the name, the extern becomes name__reentry, and every frame above a
+    // call publishes its cached tops, which the callback reads from memory
+    // (it runs at gs_sp 0). Before or after it is registered under its name.
+    void MakeReentrant(SFunction *sf) {
+        auto &ns = NS(sf->ns);
+        auto registered = false;
+        if (auto it = ns.functionmap.find(sf->name); it != ns.functionmap.end()) {
+            auto &v = it->second;
+            auto at = std::find(v.begin(), v.end(), sf);
+            if (at != v.end()) {
+                registered = true;
+                v.erase(at);
+                if (v.empty()) ns.functionmap.erase(it);
+            }
+        }
+        sf->callsname = sf->name;
+        sf->name = Intern(cat(sf->name, "__reentry"));
+        sf->qname = QualifiedName(sf->ns, sf->name);
+        if (registered) ns.functionmap[sf->name].push_back(sf);
+        sf->readsalltops = true;
+        callsexterns.push_back(sf);
+    }
     vector<SStruct *> structs;
     vector<SEnum *> enums;
     vector<SAlias *> aliases;

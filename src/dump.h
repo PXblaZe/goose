@@ -714,7 +714,12 @@ inline void FnDecl::Dump(string &s, int ind) const {
     if (sf->isinline) s += "inline ";
     if (sf->isrec) s += "recursive ";
     s += sf->isthread ? "thread_fn " : "fn ";
-    s += sf->isnested ? sf->name : sf->qname;   // See VarDecl::Dump.
+    // An extern C calls back through prints as written: its own name, which
+    // its wrapper took (SynthesizeReentry), and its calls clause.
+    auto name = sf->callsname.empty() ? sf->name : sf->callsname;
+    if (sf->isnested) s += name;
+    else if (sf->callsname.empty()) s += sf->qname;   // See VarDecl::Dump.
+    else s += sf->ns.empty() ? string(name) : cat(sf->ns, "::", name);
     DumpGenerics(s, sf->generics);
     s += "(";
     for (size_t i = 0; i < sf->params.size(); i++) {
@@ -736,7 +741,11 @@ inline void FnDecl::Dump(string &s, int ind) const {
         }
     }
     if (sf->isextern) {
-        if (sf->cname != sf->name) { s += " = "; EscapeString(s, sf->cname, '"'); }
+        for (size_t i = 0; i < sf->callsyms.size(); i++) {
+            s += i ? ", " : " calls ";
+            EscapeString(s, sf->callsyms[i], '"');
+        }
+        if (sf->cname != name) { s += " = "; EscapeString(s, sf->cname, '"'); }
         s += ";";
         return;
     }
@@ -786,6 +795,8 @@ inline void Ast::Dump(string &s) const {
     string openlib;
     for (auto d : topdecls) {
         auto fd = Is<FnDecl>(d);
+        // The reentry wrappers are made again from what the dump says.
+        if (reentryfiles >= 0 && d->line.fileidx >= reentryfiles) continue;
         auto lib = fd && !fd->sf->dylib.empty() ? fd->sf->dylib : string();
         if (!openlib.empty() && lib != openlib) {
             s += "}\n";

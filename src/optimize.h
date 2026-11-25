@@ -247,7 +247,8 @@ struct Optimizer {
         auto mainsf = ast.MainFunction();
         if (mainsf && !mainsf->specs.empty()) Reach(mainsf->specs[0]);
         for (auto sf : ast.functions)
-            if ((sf->isthread || sf->isexport) && !sf->specs.empty()) Reach(sf->specs[0]);
+            if (sf->isexport && sf->exportspec) Reach(sf->exportspec);
+            else if ((sf->isthread || sf->isexport) && !sf->specs.empty()) Reach(sf->specs[0]);
         ast.ForEachRootTree([&](Node *n) { ReachTree(n); });
     }
 

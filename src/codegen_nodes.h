@@ -1002,6 +1002,9 @@ inline void IncDec::CgStmt(CodeGen &cg) {
 
 inline void FnDecl::CgStmt(CodeGen &) {}   // Nested declarations are separate specs.
 inline void While::CgStmt(CodeGen &cg) {
+    // A reentry wrapper's loop (SynthesizeReentry) is there for the analyses
+    // only: C runs the callbacks, not this code.
+    if (auto c = Is<Call>(cond); c && c->spec && c->spec->sf->isphantom) return;
     Dst d;
     CodeGen::ViewScope vs(cg, hoistrefs, hoistfields);
     if (countdown) {

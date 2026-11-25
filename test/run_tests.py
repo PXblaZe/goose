@@ -2795,6 +2795,17 @@ def main():
     if cc or jit:
         r.show_task(extern_types)
 
+    def extern_calls():
+        from extern_calls import check_extern_calls
+        try:
+            check_extern_calls(exe, cc, gendir, jit=jit, runtime=r.runtime, extra=extra)
+            r.ok("extern calls: callbacks from C keep their callers' locals, globals judged "
+                 "as calls, recursion through C, the guard, four checker errors")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("extern calls", str(e))
+    if cc or jit:
+        r.show_task(extern_calls)
+
     def extern_dylib():
         from extern_dylib import check_extern_dylib
         try:

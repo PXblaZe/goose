@@ -2820,9 +2820,20 @@ inline void TypeCheck::CheckExport(SFunction *sf) {
     auto foreign = false;
     if (sf->body) ScanForeignFrom(sf->body, names, foreign);
     if (foreign) fail("cannot use return ... from across the C boundary");
-    if (sf->specs.size() != 1)
-        fail("could not resolve one concrete function signature");
-    auto spec = sf->specs[0];
+    // One specialization for C: one no literal argument shaped (§7.7), of
+    // the parameter types every other has.
+    FnSpec *spec = nullptr;
+    for (auto sp : sf->specs)
+        if (sp->litparams.empty()) { spec = sp; break; }
+    if (!spec) fail("could not resolve one concrete function signature");
+    for (auto sp : sf->specs) {
+        if (sp->argtypes.size() != spec->argtypes.size())
+            fail("could not resolve one concrete function signature");
+        for (size_t i = 0; i < sp->argtypes.size(); i++)
+            if (!TypeEq(sp->argtypes[i], spec->argtypes[i]))
+                fail("could not resolve one concrete function signature");
+    }
+    sf->exportspec = spec;
     // Its check failed (FnSpec::failed), which was reported: nothing more
     // can be said of the export.
     if (spec->failed) throw Abandoned {};

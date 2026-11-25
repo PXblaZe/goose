@@ -116,6 +116,17 @@ inline vector<string> CodeGen::EmitExternCall(Call *c, FnSpec *sp) {
     }
     if (sp->sf->takesloc) Append(argstr, an.empty() ? "" : ", ", CallerLoc(c->line));
     if (grows) MarkFlush();
+    // A calls clause (SynthesizeReentry): while the call runs, C may call
+    // back the exports its mask names, and no other, if Goose code on the
+    // thread the program started on made it (gs_entry_state 2; §7.11).
+    string savedstate, savedmask;
+    if (!sp->sf->callsyms.empty()) {
+        savedstate = T();
+        savedmask = T();
+        L("int ", savedstate, " = gs_entry_state; uint64_t ", savedmask, " = gs_entry_mask;");
+        L("if (", savedstate, " == 2) { gs_entry_state = 3; gs_entry_mask = (uint64_t)",
+          sp->sf->reentmask, "ull; }");
+    }
     vector<string> rets;
     if (sp->rets.empty()) {
         L(callee, "(", argstr, ");");
@@ -124,6 +135,8 @@ inline vector<string> CodeGen::EmitExternCall(Call *c, FnSpec *sp) {
         L(CT(sp->rets[0]), " ", r0, " = ", callee, "(", argstr, ");");
         rets.push_back(r0);
     }
+    if (!savedstate.empty())
+        L("gs_entry_state = ", savedstate, "; gs_entry_mask = ", savedmask, ";");
     if (grows) MarkReload();
     return rets;
 }

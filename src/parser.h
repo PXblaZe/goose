@@ -581,8 +581,17 @@ struct Parser {
                     pre.cname = lex.sval;
                     lex.Next();
                 }
+                // `extern "lib" calls "sym", ... {`: every member's calls clause.
+                vector<string> calls;
+                if (lex.tok == T_IDENT && lex.attr == "calls") {
+                    lex.Next();
+                    calls = ParseCallsList();
+                    if (lex.tok != T_LCURLY)
+                        Error("a calls clause after extern \"lib\" belongs to a block: "
+                              "extern \"lib\" calls \"symbol\" { ... }");
+                }
                 if (lex.tok == T_LCURLY) {
-                    ParseExternBlock(pre.cname, depth, startp);
+                    ParseExternBlock(pre.cname, depth, startp, calls);
                     return;
                 }
                 ast.topdecls.push_back(ParseFnDecl(false, &pre));
@@ -765,6 +774,7 @@ struct Parser {
         string_view doc;    // The documentation above the declaration (Lexer::doc).
         string cname;       // The deprecated `extern "sym" fn`'s symbol, or empty.
         string dylib;       // The block's library; empty outside a block.
+        vector<string> calls;   // The block's calls clause, which its members take.
     };
 
     // `extern "lib" { ... }` (§7.10): declarations bound from the shared
@@ -773,12 +783,27 @@ struct Parser {
     // the dump prints the block back around the run of them (Ast::Dump).
     // An error in a member loses that member, and the parse goes on at the
     // next member a skip of the rest finds (SkipBody), or past the block.
-    void ParseExternBlock(const string &lib, int depth, const char *startp) {
+    // The symbols of a calls clause, past the keyword (SFunction::callsyms).
+    vector<string> ParseCallsList() {
+        vector<string> syms;
+        for (;;) {
+            if (lex.tok != T_STRLIT)
+                Error("calls names the exported symbols C may call back: "
+                      "extern fn f(...) calls \"symbol\", ...;");
+            syms.push_back(lex.sval);
+            lex.Next();
+            if (!IsNext(T_COMMA)) break;
+        }
+        return syms;
+    }
+
+    void ParseExternBlock(const string &lib, int depth, const char *startp,
+                          const vector<string> &calls = {}) {
         if (lib.empty()) Error("an extern block names the library it binds from: extern \"lib\" {");
         Expect(T_LCURLY, "extern block");
         auto broken = false;
         while (lex.DepthBefore() > depth && lex.tok != T_RCURLY && lex.tok != T_EOF) {
-            ExternPrefix pre { CurLine(), lex.doc, "", lib };
+            ExternPrefix pre { CurLine(), lex.doc, "", lib, calls };
             auto memberp = lex.attr.data();
             ParseMembers(broken, depth, startp, [&](Ast::DeclMark &kept) {
                 ast.topdecls.push_back(ParseFnDecl(false, &pre));
@@ -900,6 +925,7 @@ struct Parser {
             ParseGenerics(sf->generics, kept);
             if (lex.tok == T_LPAREN) Role(R_LIST);
             Expect(T_LPAREN, "function declaration");
+            auto paramstart = lex.attr.data();
             while (lex.tok != T_RPAREN) {
                 Param p;
                 p.isvar = IsNext(T_VAR);
@@ -907,7 +933,11 @@ struct Parser {
                 p.name = ExpectIdent("parameter list");
                 for (auto &prev : sf->params)
                     if (prev.name == p.name) Error(cat("duplicate parameter name: ", p.name));
-                if (IsNext(T_COLON)) p.type = ParseType();
+                if (IsNext(T_COLON)) {
+                    auto typestart = lex.attr.data();
+                    p.type = ParseType();
+                    p.typetext = string_view(typestart, (size_t)(lex.prevend - typestart));
+                }
                 if (IsNext(T_ASSIGN)) {
                     // A default is a value of the parameter's type (§7.1), which
                     // an untyped parameter has only from an argument.
@@ -927,17 +957,35 @@ struct Parser {
                 KeepMember(kept);
                 if (!IsNext(T_COMMA)) break;
             }
+            auto paramend = lex.attr.data();
             Expect(T_RPAREN, "function declaration");
+            const char *retstart = nullptr, *retend = nullptr;
             if (IsNext(T_ARROW)) {
                 // Declaration headers take a bare comma-separated return type list.
                 sf->has_rets = true;
+                retstart = lex.attr.data();
                 for (;;) {
                     sf->rets.push_back(ParseType());
                     KeepMember(kept);
                     if (!IsNext(T_COMMA)) break;
                 }
+                retend = lex.prevend;
             }
             if (sf->isextern) {
+                // `calls "sym", ...` (prototype): the exports C may call back
+                // before this extern returns (SynthesizeReentry).
+                // A member takes its block's clause unless it has its own.
+                if (pre && !pre->calls.empty()) sf->callsyms = pre->calls;
+                if (lex.tok == T_IDENT && lex.attr == "calls") {
+                    lex.Next();
+                    sf->callsyms = ParseCallsList();
+                }
+                if (!sf->callsyms.empty() && !sf->generics.empty())
+                    Error("a generic extern cannot have a calls clause");
+                // Kept for every extern: one bound to an export of the program
+                // calls it without saying so (SynthesizeReentry).
+                sf->callsparams = string_view(paramstart, (size_t)(paramend - paramstart));
+                if (retstart) sf->callsrets = string_view(retstart, (size_t)(retend - retstart));
                 // The symbol where a body would go: `fn delay(ms: u32) = "SDL_Delay";`.
                 if (IsNext(T_ASSIGN)) {
                     if (lex.tok != T_STRLIT)
@@ -961,6 +1009,8 @@ struct Parser {
                                sf->cname == "gs_slice_pool_free" ||
                                sf->cname == "gs_slice_pool_regrow" ||
                                sf->cname == "gs_slice_pool_trim";
+                sf->isphantom = sf->cname == "gs_reentry_phantom" || sf->cname == "gs_reentry_any";
+                if (!sf->callsyms.empty()) ast.MakeReentrant(sf);
                 Expect(T_SEMI, "extern declaration");
             } else if (lex.tok == T_ASSIGN) {
                 Error("only an extern fn takes a symbol after its signature: = \"symbol\" (§7.10)");

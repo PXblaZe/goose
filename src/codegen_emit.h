@@ -992,6 +992,11 @@ inline void CodeGen::EmitProgramInit() {
     // at gs_sp 0, over stacks whose tops running Goose code may hold in
     // locals, and on a worker's block it may not even have its stacks.
     Append(data, "static GS_TLS int gs_entry_state;\n");
+    // 3: inside an extern fn with a calls clause, called from Goose code on
+    // the thread the program started on, while C may call back the exports
+    // whose bits gs_entry_mask holds (CodeGen::EmitExternCall). 4: a worker's
+    // Goose code, which no calls clause opens to a callback.
+    Append(data, "static GS_TLS uint64_t gs_entry_mask;\n");
     // Every function is emitted by now, so the counts are final: the main
     // program's stacks, and the most regions it and any one worker hold.
     // The worker thunks follow, each opening its program's block.
@@ -1066,9 +1071,9 @@ inline void CodeGen::EmitExports() {
     auto refusal = false;
     for (auto sf : ast.functions) {
         if (!sf->isexport) continue;
-        if (sf->specs.size() != 1 || !sinfo.count(sf->specs[0]))
+        auto sp = sf->exportspec ? sf->exportspec : sf->specs.empty() ? nullptr : sf->specs[0];
+        if (!sp || !sinfo.count(sp))
             Fail(sf->line, cat("export fn ", sf->name, " has no emitted specialization"));
-        auto sp = sf->specs[0];
         auto &si = sinfo[sp];
         auto returnslice = !sp->rets.empty() && sp->rets[0]->kind == TY_SLICE;
         string params, args;
@@ -1106,32 +1111,41 @@ inline void CodeGen::EmitExports() {
                          "    gs_panic(reentered);\n"
                          "}\n\n");
         }
+        // A host's call, or C called back from inside an extern whose calls
+        // clause names this export (state 3 with its bit); the state it was
+        // entered in is restored on the way out.
+        auto entered = Unique("gs_export_entered");
+        auto admit = sf->exportbit < 0 ? cat(entered, " != 1")
+                     : cat(entered, " != 1 && !(", entered, " == 3 && ((gs_entry_mask >> ",
+                           sf->exportbit, ") & 1))");
         Append(code, hostexport, ret, " ", sf->cname, "(", params, ") {\n"
-                     "    if (gs_entry_state != 1)\n"
+                     "    int ", entered, " = gs_entry_state;\n"
+                     "    if (", admit, ")\n"
                      "        gs_export_refused(\"export fn ", sf->name, " was called by C that "
                      "Goose code called, before it returned; only a C host may call an export, "
-                     "between its calls into Goose\");\n"
+                     "between its calls into Goose, or C called from an extern fn whose calls "
+                     "clause names \\\"", sf->cname, "\\\"\");\n"
                      "    gs_entry_state = 2;\n");
         if (returnslice) {
             auto value = Unique("gs_export_result");
             Append(code, "    if (!", outlen,
                    ") gs_panic(\"exported slice length pointer is null\");\n");
             Append(code, "    ", CT(sp->rets[0]), " ", value, " = ", si.cname, "(", args,
-                   ");\n"
-                   "    gs_entry_state = 1;\n"
+                   ");\n",
+                   cat("    gs_entry_state = ", entered, ";\n"),
                    "    *", outlen, " = ", value, ".len;\n"
                    "    return (const uint8_t *)", value, ".data;\n");
         } else if (sp->rets.empty()) {
-            Append(code, "    ", si.cname, "(", args, ");\n    gs_entry_state = 1;\n");
+            Append(code, "    ", si.cname, "(", args, ");\n    gs_entry_state = ", entered, ";\n");
         } else if (!outres.empty()) {
             Append(code, "    ", CT(sp->rets[0]), " ", outres, ";\n",
                    "    ", si.cname, "(", args, ");\n",
-                   "    gs_entry_state = 1;\n"
+                   cat("    gs_entry_state = ", entered, ";\n"),
                    "    return ", outres, ";\n");
         } else {
             auto value = Unique("gs_export_result");
             Append(code, "    ", CT(sp->rets[0]), " ", value, " = ", si.cname, "(", args, ");\n",
-                   "    gs_entry_state = 1;\n"
+                   cat("    gs_entry_state = ", entered, ";\n"),
                    "    return ", value, ";\n");
         }
         Append(code, "}\n\n");

@@ -3429,6 +3429,43 @@ builder. The compiler assumes an extern may write through its arguments
 but does not mutate unrelated Goose globals; C code is responsible for
 honoring those obligations.
 
+**Calling back into Goose (prototype).** C may call one of the program's
+exported functions (§11.2) before an extern returns only where the extern
+says so:
+
+```goose
+extern fn qsort_rows(rows: i64[:]) calls "compare_rows";
+extern recursive fn walk(node: u64) -> i64 calls "visit";
+extern "toolkit" calls "on_event", "on_paint" { fn run(); fn show(w: u64); }
+```
+
+`calls` names the exports by their C symbols, after the return type and
+before `= "symbol"`; on an extern block it applies to every member that
+names none of its own. A symbol that no export of the program carries is
+ignored, since C cannot call it.
+
+A call of such an extern is checked as a Goose function that calls the
+extern, then any number of times calls each named export and calls the
+extern again, with the same arguments:
+
+* what the exports may shrink, grow, store or bind is judged at the call
+  as if the caller made those calls (§5): a slice or reference still used
+  after the call, or passed to the extern, may not point into storage a
+  callback may shrink;
+* every frame up the chain writes back the data-stack tops it caches
+  before the call and reads them again after it, and the callback's
+  allocations go above them;
+* an export that calls back into C through an extern naming it again is a
+  recursive cycle (§7.8): the extern is the cycle's entry and is declared
+  `extern recursive fn`, and no function of the cycle may hold a nonfixed
+  local across that call.
+
+This is the one exception to §7.11's rule that only a C host calls an
+export: while such an extern runs, called by Goose code on the thread the
+program started on, C may call the exports its clause names, and those
+only. Any other export C calls then, and any export C calls from an extern
+without a clause or from a worker's code, is refused as §7.11 says.
+
 **Binding from a shared library.** An `extern` block names a shared
 library and declares functions that are bound from it by name when the
 program starts, without any C code of the program's own and without
@@ -3539,7 +3576,8 @@ thread. Only the C host calls an export through its C symbol, between its
 calls into Goose. C that Goose code called (an `extern fn`, from `main`, a
 worker or a global's initializer) calling an export before it returns is a
 runtime error, since the export would run over the data stacks of the Goose
-code that is still running. In a program that starts threads, a call on a
+code that is still running, unless the extern names the export in a calls
+clause (§7.10). In a program that starts threads, a call on a
 thread other than the initializing one is a runtime error too. An `extern
 fn` whose C symbol is one of the program's exports is a compile error: Goose
 code calls the export as the Goose function it is. `--header` requires
